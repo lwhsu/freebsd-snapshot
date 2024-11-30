@@ -1,0 +1,263 @@
+.\"
+.\" FreeBSD UFS/ZFS Snapshot Management Environment
+.\" Copyright (C) 1992-2007 The FreeBSD Project. All rights reserved.
+.\"
+.\" Redistribution and use in source and binary forms, with or without
+.\" modification, are permitted provided that the following conditions
+.\" are met:
+.\" 1. Redistributions of source code must retain the above copyright
+.\"    notice, this list of conditions and the following disclaimer.
+.\" 2. Redistributions in binary form must reproduce the above copyright
+.\"    notice, this list of conditions and the following disclaimer in the
+.\"    documentation and/or other materials provided with the distribution.
+.\"
+.\" THIS SOFTWARE IS PROVIDED BY AUTHOR AND CONTRIBUTORS ``AS IS'' AND
+.\" ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+.\" IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+.\" ARE DISCLAIMED.  IN NO EVENT SHALL AUTHOR OR CONTRIBUTORS BE LIABLE
+.\" FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+.\" DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
+.\" OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
+.\" HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
+.\" LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
+.\" OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
+.\" SUCH DAMAGE.
+.\"
+.\" snapshot.8: snapshot management utility (manual page)
+.\" $FreeBSD$
+.\"
+.Dd September 3, 2004
+.Dt SNAPSHOT 8
+.Os
+.Sh NAME
+.Nm snapshot
+.Nd UFS/ZFS snapshot management utility
+.Sh SYNOPSIS
+.Nm
+.Op Ar options
+.Op Ar command
+.Op Ar arguments
+.Sh DESCRIPTION
+The
+.Nm
+command is a convenience frontend to
+.Xr mount 8
+and
+.Xr mdconfig 8
+for the management of UFS/ZFS snapshots.
+It is also the underlying tool used in the
+periodic snapshot scheduler
+.Xr periodic-snapshot 8
+and the mounting/unmouning command
+in the
+.Xr amd 8
+map
+.Pa /etc/amd.map.snap .
+It provides the making, expiring, visiting, mounting
+and unmounting of filesystem snapshots.
+.Pp
+The following global options are available:
+.Bl -tag -width indent
+.It Fl v
+Display verbose messages showing the essential
+system commands involved in the operation.
+.It Fl h
+Display a short usage help message and exit.
+.It Fl d Ar subdir
+Set the subdirectory on filesystems under
+which snapshots are placed. The default
+is the conventional
+.Pa .snap
+subdirectory
+.Xr dump 8
+uses, too.
+.El
+.Pp
+The following commands are available:
+.Bl -tag -width indent
+.It Xo Nm
+.Ic list
+.Op Ar fs ...
+.Xc
+List all existing snapshots on all filesystems or just the
+particular filesystems specified by
+.Ar fs .
+The output shows both actual disk-space user usage ("User", "User%")
+and the disk-space snapshot usage ("Snap", "Snap%").
+.It Xo Nm
+.Ic make
+.Op Fl g Ar max-generations
+.Ar fs Ns : Ns Ar tag Ns Op Ns . Ns Ar generation
+.Xc
+Makes a new snapshot generation named
+.Ar tag
+on filesystem
+.Ar fs ,
+located in the file
+.Ar fs Ns / Ns Ar subdir Ns / Ns Ar tag Ns . Ns Ar generation .
+If the
+.Ar generation
+part is omitted, generation
+0 is used. All older generations (with
+numbers greater than
+.Ar generation )
+are rotated and all
+obsoleted generations (with numbers
+greater or equal to
+.Ar max-generations )
+are removed. Keep in mind that a maximum total number
+of 20 snapshots can be
+created on a UFS filesystem only.
+A
+.Ar max-generations
+number of 0 effectively deletes all
+snapshots on filesystem
+.Ar fs
+of name
+.Ar tag
+only.
+.It Xo Nm
+.Ic mount
+.Op Fl o Ar mount-option
+.Ar fs Ns : Ns Ar tag Ns Op Ns . Ns Ar generation
+.Ar dir
+.Xc
+Mounts the
+.Ar fs
+snapshot
+.Ar tag Ns . Ns Ar generation
+(or
+.Ar tag Ns .0 if
+.Ar generation is omitted)
+under
+.Ar dir
+by attaching the snapshot file to the next
+free
+.Xr md 4
+device and mounting this device
+read-only onto the target directory.
+If options
+.Fl o
+are specified, they are passed-through
+to
+.Xr mount 8 .
+.It Xo Nm
+.Ic umount
+.Ar dir
+.Xc
+Unmounts a
+snapshot
+by umounting the
+.Xr md 4
+device from
+.Xr dir ,
+deattaching the snapshot file from
+the corresponding
+.Xr md 4
+device and deleting the
+device.
+.It Xo Nm
+.Ic visit
+.Ar fs Ns : Ns Ar tag Ns Op Ns . Ns Ar generation
+.Xc
+This is just a convenience command which
+mounts the specified filesystem on
+.Pa /mnt ,
+temporarily changes to
+.Pa /mnt,
+starts an interactive shell there for inspecting the snapshot content,
+and upon exit from the shell immediately unmounts the snapshot again.
+.El
+.Sh EXAMPLE
+The following sample session illustrates the making, rotation,
+mounting, unmounting and removal of snapshots:
+.Bd -literal -offset indent
+root# snapshot list /var
+Filesystem          User   User%     Snap   Snap%  Snapshot
+root# snapshot make -g4 /var:test
+root# snapshot list /var
+Filesystem          User   User%     Snap   Snap%  Snapshot
+/var              1172MB   14.8%      4MB    0.1%  test.0
+root# snapshot make -g4 /var:test
+root# snapshot list /var
+Filesystem          User   User%     Snap   Snap%  Snapshot
+/var              1176MB   14.8%      4MB    0.1%  test.0
+/var              1176MB   14.8%      4MB    0.1%  test.1
+root# snapshot make -g4 /var:test
+root# snapshot list /var
+Filesystem          User   User%     Snap   Snap%  Snapshot
+/var              1181MB   14.9%      4MB    0.1%  test.0
+/var              1181MB   14.9%      4MB    0.1%  test.1
+/var              1181MB   14.9%      4MB    0.1%  test.2
+root# snapshot make -g4 /var:test
+root# snapshot list /var
+Filesystem          User   User%     Snap   Snap%  Snapshot
+/var              1186MB   15.0%      4MB    0.1%  test.0
+/var              1186MB   15.0%      4MB    0.1%  test.1
+/var              1186MB   15.0%      4MB    0.1%  test.2
+/var              1186MB   15.0%      4MB    0.1%  test.3
+root# snapshot make -g4 /var:test
+root# snapshot list /var
+Filesystem          User   User%     Snap   Snap%  Snapshot
+/var              1186MB   15.0%      4MB    0.1%  test.0
+/var              1186MB   15.0%      4MB    0.1%  test.1
+/var              1186MB   15.0%      4MB    0.1%  test.2
+/var              1186MB   15.0%      4MB    0.1%  test.3
+root# snapshot mount /var:test.2 /mnt
+root# ls /mnt
+.snap      crash      games      lost+found obj        rwho
+account    cron       heimdal    mail       opkg       spool
+at         db         lib        msgs       preserve   tmp
+backups    empty      log        named      run        yp
+root# snapshot umount /mnt
+root# snapshot make -g0 /var:test
+root# snapshot list /var
+Filesystem          User   User%     Snap   Snap%  Snapshot
+root# _
+.Ed
+.Pp
+By using an
+.Xr amd 8
+map
+.Pa /etc/amd.map.snap
+containing
+.Bd -literal -offset indent
+/defaults type:=program
+*         mount:="/usr/sbin/snapshot snapshot mount /${key} ${fs}";\\
+          unmount:="/usr/sbin/snapshot snapshot umount ${fs}"
+.Ed
+.Pp
+and a
+.Pa /etc/rc.conf
+configuration of
+.Bd -literal -offset indent
+amd_enable="YES"
+amd_flags="-a /.am -c 1800 -w 60 -l syslog /snap /etc/amd.map.snap"
+.Ed
+.Pp
+even non-privileged users can access arbitrary snapshots
+.Ar fs Ns : Ns Ar tag Ns Op Ar generation
+by just accessing
+.Pa /snap/ Ns Ar fs Ns : Ns Ar tag Ns Op Ar generation .
+For instance, if a snapshot
+.Pa hourly.2
+exists on filesystem
+.Pa /var
+one can then access an old state of file
+.Pa /var/tmp/foo.txt
+by simply accessing the path
+.Pa /snap/var:hourly.2/tmp/foo.txt .
+.Sh SEE ALSO
+.Xr mount 8 ,
+.Xr mdconfig 8 ,
+.Xr md 4 ,
+.Xr periodic-snapshot 8 ,
+.Xr http://people.freebsd.org/~rse/snapshot/ .
+.Pp
+.Sh HISTORY
+The
+.Nm
+utility first appeared in
+.Fx .
+.Sh AUTHORS
+.An Ralf S. Engelschall Aq rse@FreeBSD.org

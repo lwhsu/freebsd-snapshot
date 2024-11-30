@@ -1,0 +1,138 @@
+#!/bin/sh
+##
+##  FreeBSD UFS/ZFS Snapshot Management Environment
+##  Copyright (c) 2004-2007 The FreeBSD Project. All rights reserved.
+##  
+##  Redistribution and use in source and binary forms, with or without
+##  modification, are permitted provided that the following conditions
+##  are met:
+##  1. Redistributions of source code must retain the above copyright
+##     notice, this list of conditions and the following disclaimer.
+##  2. Redistributions in binary form must reproduce the above copyright
+##     notice, this list of conditions and the following disclaimer in the
+##     documentation and/or other materials provided with the distribution.
+##  
+##  THIS SOFTWARE IS PROVIDED BY AUTHOR AND CONTRIBUTORS ``AS IS'' AND
+##  ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+##  IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+##  ARE DISCLAIMED.  IN NO EVENT SHALL AUTHOR OR CONTRIBUTORS BE LIABLE
+##  FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+##  DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
+##  OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
+##  HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
+##  LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
+##  OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
+##  SUCH DAMAGE.
+##
+##  periodic-snapshot: snapshot periodic scheduler (implementation)
+##  $FreeBSD$
+##
+
+#   make sure system tools are used first
+PATH="/bin:/usr/bin:/sbin:/usr/sbin:$PATH"
+
+#   configuration defaults
+snapshot_enable="NO"
+snapshot_schedule="*:0:0:2@8,12,16,20"
+
+#   configuration overriding
+if [ -r /etc/defaults/periodic.conf ]; then
+    . /etc/defaults/periodic.conf
+    source_periodic_confs
+fi
+
+#   short-circuit processing if not enabled
+case "$snapshot_enable" in
+    [Yy][Ee][Ss] )        ;;
+    *            ) exit 0 ;;
+esac
+
+#   determine run-time tag and current hour
+time_tag="$1"
+time_hour=$((0 + `date '+%k'`))
+
+#   interate over all schedules
+for schedule in $snapshot_schedule; do
+    #   parse schedule into filesystem list and time specification
+    when="0:0:2@8,12,16,20"
+    eval `echo "$schedule" |\
+        sed -e 's/^/X/' \
+            -e 's/^X\([^:]*\):\(.*\)$/fs_list="\1"; when="\2"/' \
+            -e 's/^X\(.*\)$/fs_list="\1"/'`
+
+    #   parse time specification into weekly, daily and hourly parts
+    when_weekly="0"
+    when_daily="0"
+    when_hourly="0"
+    eval `echo "$when" |\
+        sed -e 's/^/X/' \
+            -e 's/^X\([0-9][0-9]*\):\([0-9][0-9]*\):\(.*\)$/when_weekly="\1"; when_daily="\2"; when_hourly="\3"/' \
+            -e 's/^X\([0-9][0-9]*\):\(.*\)$/when_weekly="\1"; when_daily="\2"; when_daily="\2"/' \
+            -e 's/^X\(.*\)$/when_weekly="\1"/'`
+
+    #   parse hourly time specification part into count and list
+    when_hourly_list="0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23"
+    eval `echo "$when_hourly" |\
+        sed -e 's/^/X/' \
+            -e 's/^X\([0-9][0-9]*\)@\(.*\)$/when_hourly="\1"; when_hourly_list="\2"/' \
+            -e 's/^X\(.*\)$/when_hourly="\1"/'`
+
+    #   expand special wildcard filesystem specification
+    if [ ".$fs_list" = ".*" ]; then
+        fs_list="`mount -t ufs | grep -v ^/dev/md | sed -e 's;^.*on \(/[^ ]*\) .*$;\1;'`"
+        fs_list="$fs_list `mount -t zfs | sed -e 's;^.*on \(/[^ ]*\) .*$;\1;'`"
+    fi
+
+    #   iterate over all filesystems
+    OIFS="$IFS"; IFS="$IFS,"
+    for fs in $fs_list; do
+        IFS="$OIFS"
+        #   sanity check filesystem snapshot schedule
+        if [ $((0 + $when_weekly + $when_daily + $when_hourly)) -gt 20 ]; then
+            logger -p daemon.warning \
+                "snapshot: schedule $schedule on filesystem $fs would require more than maximum number of 20 possible snapshots"
+        fi
+
+        #   determine whether to make a snapshot
+        #   and if current time requires it, make it
+        ok=no
+        if [ ".$time_tag" = .weekly ]; then
+            ok=yes
+        elif [ ".$time_tag" = .daily ]; then
+            ok=yes
+        elif [ ".$time_tag" = .hourly ]; then
+            ok=no
+            OIFS="$IFS"; IFS=","
+            for hour in $when_hourly_list; do
+                IFS="$OIFS"
+                if [ ".$hour" = ".$time_hour" ]; then
+                    ok=yes
+                    break
+                fi
+            done
+            IFS="$OIFS"
+        fi
+        if [ ".$ok" = .yes ]; then
+            eval "when=\$when_${time_tag}"
+            if [ ".$when" != .0 ]; then
+                #   make new snapshot
+                time_start=`date '+%s'`
+                lockf -s -t 0 $fs/.snapshot.lock \
+                snapshot make -g$when $fs:$time_tag.0
+                if [ $? -ne 0 ]; then
+                    logger -p daemon.error \
+                        "snapshot: making snapshot on $fs failed"
+                    exit 1
+                fi
+                time_end=`date '+%s'`
+                duration=$((($time_end - $time_start) / 60))
+                logger -p daemon.notice \
+                    "snapshot: $time_tag.0 snapshot on filesystem $fs made (duration: $duration min)"
+            fi
+        fi
+    done
+    IFS="$OIFS"
+done
+
+exit 0
+

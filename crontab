@@ -1,0 +1,4 @@
+# Perform hourly/daily/weekly maintenance (FreeBSD UFS/ZFS snapshots only).
+0       *       *       *       *       root    periodic-snapshot hourly
+0       0       *       *       *       root    periodic-snapshot daily
+0       0       *       *       0       root    periodic-snapshot weekly

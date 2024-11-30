@@ -1,0 +1,334 @@
+<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd">
+<html>
+  <head>
+    <link rel="stylesheet" type="text/css" href="../shared.css"/>
+    <title>FreeBSD UFS/ZFS Snapshot Management Environment</title>
+  </head>
+  <body>
+    <div>
+
+    <div class="header">
+      <div class="title">FreeBSD UFS/ZFS Snapshot<br>Management Environment</div>
+      <div class="subtitle">How to Deliver FreeBSD UFS/ZFS Snapshots to End-Users</div>
+      <div class="author">Ralf S. Engelschall &lt;<a href="mailto:rse@FreeBSD.org">rse@FreeBSD.org</a>&gt;</div>
+      <div class="date">Written: 29-Aug-2004<br/>Last Modified: 11-Nov-2007</div>
+    </div>
+
+    <h1>Problem</h1>
+    
+    <p/>
+    The FreeBSD <a href="http://en.wikipedia.org/wiki/UFS">UFS</a>
+    (both UFS1 and UFS2) 
+    and
+    <a href="http://en.wikipedia.org/wiki/ZFS">ZFS</a>
+    filesystems provides the possibility to create
+    snapshots of live filesystems. On UFS is already best
+    known (and can be easily used) for allowing <a
+    href="http://www.freebsd.org/cgi/man.cgi?query=fsck&sektion=8&apropos=0&manpath=FreeBSD+8-current">fsck(8)</a>
+    to run in the background
+    (see <a href="http://www.freebsd.org/cgi/man.cgi?query=rc.conf&apropos=0&sektion=0&manpath=FreeBSD+8-current&format=html"><tt>rc.conf</tt></a> variable <tt>background_fsck</tt>)
+    and to create consistent filesystem dumps (see 
+    <a href="http://www.freebsd.org/cgi/man.cgi?query=dump&sektion=8&apropos=0&manpath=FreeBSD+8-current">dump(8)</a> option <tt>-L</tt>).
+    In ZFS snapshots even can be used with the
+    <a href="http://www.freebsd.org/cgi/man.cgi?query=dump&sektion=8&apropos=0&manpath=FreeBSD+8-current">zfs(8)</a> <tt>send</tt> and <tt>receive</tt>
+    commands to easily replicate ZFS filesystems.
+
+    <p/>
+    Additionally, with the help of <a href="http://www.freebsd.org/cgi/man.cgi?query=md&apropos=0&sektion=4&manpath=FreeBSD+6-current&format=html">md(4)</a>
+    and <a href="http://www.freebsd.org/cgi/man.cgi?query=mdconfig&apropos=0&sektion=8&manpath=FreeBSD+6-current&format=html">mdconfig(8)</a>
+    you can mount UFS snapshots as read-only filesystems, too.
+    For illustration purposes, look at this sample session where a snapshot of
+    <tt>/var</tt> is created on UFS:
+    
+    <pre class="screenshot">
+# <span class="command">echo "<span class="standout">before</span>" &gt;/var/tmp/foo.txt</span>
+# <span class="command">ls -l /var/tmp/foo.txt</span>
+-rw-r--r--  1 root  wheel  7 Sep  3 16:19 /var/tmp/foo.txt
+
+# <span class="command">test -d /var/.snap || mkdir /var/.snap</span>
+# <span class="command">mount -u -o snapshot /var/.snap/test /var</span>
+# <span class="command">ls -l /var/.snap/test</span>
+-r--------  1 root  operator  2147483784 Sep  3 16:19 /var/.snap/test
+
+# <span class="command">echo "<span class="standout">after</span>" &gt;/var/tmp/foo.txt</span>
+# <span class="command">ls -l /var/tmp/foo.txt</span>
+-rw-r--r--  1 root  wheel  6 Sep  3 16:20 /var/tmp/foo.txt
+
+# <span class="command">mdconfig -a -t vnode -f /var/.snap/test -u 1</span>
+# <span class="command">mount -o ro /dev/md1 /mnt</span>
+# <span class="command">ls -l /mnt/tmp/foo.txt /var/tmp/foo.txt</span>
+-rw-r--r--  1 root  wheel  <span class="standout">7</span> Sep  3 16:19 /mnt/tmp/foo.txt
+-rw-r--r--  1 root  wheel  <span class="standout">6</span> Sep  3 16:20 /var/tmp/foo.txt
+# <span class="command">cat /mnt/tmp/foo.txt /var/tmp/foo.txt</span>
+<span class="standout">before
+after</span>
+
+# <span class="command">umount /mnt</span>
+# <span class="command">mdconfig -d -u 1</span>
+# <span class="command">rm -f /var/.snap/test</span>
+    </pre>
+
+    <p/>
+    The same session with <tt>/var</tt> on ZFS could look like this:
+    <pre class="screenshot">
+# <span class="command">echo "<span class="standout">before</span>" &gt;/var/tmp/foo.txt</span>
+# <span class="command">ls -l /var/tmp/foo.txt</span>
+-rw-r--r--  1 root  wheel  7 Sep  3 16:19 /var/tmp/foo.txt
+
+# <span class="command">zfs snapshot `zfs list -H -o name /var`@test</span>
+# <span class="command">ls -ld /var/.zfs/snapshot/test</span>
+drwxr-xr-x 23 root  operator  23 Sep  3 16:19 /var/.zfs/snapshot/test
+
+# <span class="command">echo "<span class="standout">after</span>" &gt;/var/tmp/foo.txt</span>
+# <span class="command">ls -l /var/tmp/foo.txt</span>
+-rw-r--r--  1 root  wheel  6 Sep  3 16:20 /var/tmp/foo.txt
+
+# <span class="command">ls -l /var/.zfs/snapshot/test/tmp/foo.txt /var/tmp/foo.txt</span>
+-rw-r--r--  1 root  wheel  <span class="standout">7</span> Sep  3 16:19 /mnt/tmp/foo.txt
+-rw-r--r--  1 root  wheel  <span class="standout">6</span> Sep  3 16:20 /var/tmp/foo.txt
+# <span class="command">cat /var/.zfs/snapshot/test/tmp/foo.txt /var/tmp/foo.txt</span>
+<span class="standout">before
+after</span>
+
+# <span class="command">zfs destroy `zfs list -H -o name /var`@test</span>
+    </pre>
+
+    <p/>
+    As you can see, one can easily create filesystem snapshots on both UFS and ZFS and use it to
+    recover old states of files. Unfortunately, this is all the FreeBSD 7
+    base system currently provides out-of-the-box. There is neither an
+    easy way to regularily create new and expire old snapshots
+    nor an easy -- or even unpriviledged -- way to access the snapshot data.
+    Additionally, although the involved steps and commands are not really
+    complicated, they are not convenient enough for daily work.
+    Although ZFS snapshots are certainly already easier to use than UFS snapshots,
+    one nevertheless have to remember the particular commands. Additionally,
+    the differences in snapshot management between UFS and ZFS makes
+    the daily work complicated, too.
+
+    <p/>
+    Keep in mind that regular filesystem backup snapshots are a great
+    solution for easily recovering old file states within a small time
+    frame. But only if the interface for the end-user follows the KISS
+    principle. And at least this is IMHO not the case under our FreeBSD
+    until now.
+    
+    <p/>
+    On the other hand, at my previous work my home directory was placed on an
+    NFS-mounted WAFL&reg; filesystem provided by an ONTAP&reg; based Filer
+    from Network Appliance. For instance, after you have configured
+    scheduled snapshots with the ONTAP&reg; command "<tt>snap sched 0 0
+    4</tt>", you can easily and at any time recover old states (as a regular
+    user) in hourly steps for the last 4 hours:
+
+    <pre class="screenshot">
+$ <span class="command">echo "<span class="standout">before</span>" &gt;foo.txt</span>
+$ <span class="command">sleep 3601</span>
+$ <span class="command">echo "<span class="standout">middle</span>" &gt;foo.txt</span>
+$ <span class="command">sleep 3601</span>
+$ <span class="command">echo "<span class="standout">after</span>" &gt;foo.txt</span>
+
+$ <span class="command">ls -la | fgrep .snapshot</span>
+$ <span class="command">cat .snapshot/hourly.1/foo.txt .snapshot/hourly.0/foo.txt foo.txt</span>
+<span class="standout">before
+middle
+after</span>
+    </pre>
+
+    <p/>
+    As you have seen above, ZFS more or less already provides this
+    approach. Unfortunately, UFS is far away from this approach. So,
+    we need at least an abstraction layer to let us handle UFS and ZFS
+    identicially...
+
+    <h1>Solution</h1>
+
+    An abstracted snapshot managemebt service should be provided to
+    our users under FreeBSD. We achieve this by implementing three
+    solutions:
+
+    <ol>
+      <li><b>Snapshot Management Frontend:</b><br>
+          The involved commands should be wrapped by a frontend utility
+          <a href="snapshot.8.html">snapshot(8)</a> which provides a
+          more simple and convenient way to create, expire, mount and
+          unmount snaphots (independent whether this is on UFS or ZFS).
+
+          <pre class="screenshot">
+# <span class="command">snapshot list /var</span>
+Filesystem          User   User%     Snap   Snap%  Snapshot
+# <span class="command">snapshot make -g4 /var:test</span>
+# <span class="command">snapshot list /var</span>
+Filesystem          User   User%     Snap   Snap%  Snapshot
+/var              1172MB   14.8%      4MB    0.1%  test.0
+# <span class="command">snapshot make -g4 /var:test</span>
+# <span class="command">snapshot list /var</span>
+Filesystem          User   User%     Snap   Snap%  Snapshot
+/var              1176MB   14.8%      4MB    0.1%  test.0
+/var              1176MB   14.8%      4MB    0.1%  test.1
+# <span class="command">snapshot make -g4 /var:test</span>
+# <span class="command">snapshot list /var</span>
+Filesystem          User   User%     Snap   Snap%  Snapshot
+/var              1181MB   14.9%      4MB    0.1%  test.0
+/var              1181MB   14.9%      4MB    0.1%  test.1
+/var              1181MB   14.9%      4MB    0.1%  test.2
+# <span class="command">snapshot make -g4 /var:test</span>
+# <span class="command">snapshot list /var</span>
+Filesystem          User   User%     Snap   Snap%  Snapshot
+/var              1186MB   15.0%      4MB    0.1%  test.0
+/var              1186MB   15.0%      4MB    0.1%  test.1
+/var              1186MB   15.0%      4MB    0.1%  test.2
+/var              1186MB   15.0%      4MB    0.1%  test.3
+# <span class="command">snapshot make -g4 /var:test</span>
+# <span class="command">snapshot list /var</span>
+Filesystem          User   User%     Snap   Snap%  Snapshot
+/var              1186MB   15.0%      4MB    0.1%  test.0
+/var              1186MB   15.0%      4MB    0.1%  test.1
+/var              1186MB   15.0%      4MB    0.1%  test.2
+/var              1186MB   15.0%      4MB    0.1%  test.3
+# <span class="command">snapshot mount /var:test.2 /mnt</span>
+# <span class="command">ls /mnt</span>
+.snap      crash      games      lost+found obj        rwho
+account    cron       heimdal    mail       opkg       spool
+at         db         lib        msgs       preserve   tmp
+backups    empty      log        named      run        yp
+# <span class="command">snapshot umount /mnt</span>
+# <span class="command">snapshot make -g0 /var:test</span>
+# <span class="command">snapshot list /var</span>
+Filesystem          User   User%     Snap   Snap%  Snapshot
+          </pre>
+      <p/>
+      <li><b>Periodic and Flexible Backup Snapshot Creation</b><br>
+          There has to be a flexible and easy way to configure
+          periodically created backup snapshots. For instance, to have available
+          two "daily" snapshots for <tt>/</tt> and <tt>/usr</tt>, two daily
+          and four hourly (created every hour) for
+          <tt>/var</tt> and two weekly, seven daily and eight hourly (created at
+          times 08:00, 12:00, 16:00 and 20:00) snapshots for <tt>/home/</tt> all
+          which is required should be (similar to the syntax of the ONTAP
+          "<tt>snap sched</tt>" command):
+
+          <pre class="screenshot">
+$ <span class="command">grep ^snapshot_ /etc/periodic.conf</span>
+snapshot_enable="YES"
+snapshot_schedule="/,/usr:0:2:0 /var:0:2:4 /home:2:7:8@8,12,16,20"
+          </pre>
+      <p/>
+      <li><b>Easy Access to Backup Snapshot Data</b><br>
+          There has to be an easy way to access the data of an arbitrary
+          backup snapshot as a regular user. Mostly similar to the
+          <tt>.snapshot</tt> sub-directory feature on WAFL (we use a
+          top-level <tt>/snap</tt> directly here because this is what
+          can be provided by <a href="http://www.freebsd.org/cgi/man.cgi?query=amd&apropos=0&sektion=8&manpath=FreeBSD+6-current&format=html">amd(8)</a> easily and without any performance
+          penalties and stability issues):
+
+          <pre class="screenshot">
+$ <span class="command">df | egrep '(/snap|/.am)'; ls -l /snap</span>
+pid1562@en2:/snap           0       0        0   100%    /snap
+
+$ <span class="command">cd /home/rse</span>
+$ <span class="command">echo "before" &gt;foo.txt</span>
+$ <span class="command">sleep 3601</span>
+$ <span class="command">echo "middle" &gt;foo.txt</span>
+$ <span class="command">sleep 3601</span>
+$ <span class="command">echo "after" &gt;foo.txt</span>
+$ <span class="command">cat /snap/home:hourly.1/rse/foo.txt /snap/home:hourly.0/rse/foo.txt foo.txt</span>
+before
+middle
+after
+
+$ <span class="command">df | egrep '(/snap|/.am)'; ls -l /snap</span>
+pid1562@en2:/snap           0       0        0   100%    /snap
+/dev/md1              2026030    2464  1861484     0%    /.am/en2/snap/var:hourly.0
+lrwxrwxrwx  1 root  wheel  26 Sep  3 16:38 var:hourly.0 -&gt; /.am/en2/snap/var:hourly.0
+$ <span class="command">sleep 3600</span>
+$ <span class="command">df | egrep '(/snap|/.am)'; ls -l /snap</span>
+pid1562@en2:/snap           0       0        0   100%    /snap
+          </pre>
+
+          As the surrounding df(1) and ls(1) calls show, amd(8) on
+          demand mounts the snapshot files and after about 5 minutes of
+          no access it automatically unmounts them again.
+    </ol>
+
+    <p/>
+    With those three solutions, FreeBSD snapshots are available to our
+    unprivileged users as a short-time backup solution allowing them to
+    easily recover their older file states.
+
+    </p>
+
+    <h1>Implementation</h1>
+
+    The implementation is straight-forward and based on <a href="http://www.freebsd.org/cgi/man.cgi?query=mount&apropos=0&sektion=8&manpath=FreeBSD+8-current&format=html">mount(8)</a>,
+    <a href="http://www.freebsd.org/cgi/man.cgi?query=mdconfig&apropos=0&sektion=8&manpath=FreeBSD+8-current&format=html">mdconfig(8)</a>, <a href="http://www.freebsd.org/cgi/man.cgi?query=amd&apropos=0&sektion=8&manpath=FreeBSD+8-current&format=html">amd(8)</a> and 
+    <a href="http://www.freebsd.org/cgi/man.cgi?query=cron&apropos=0&sektion=8&manpath=FreeBSD+8-current&format=html">cron(8)</a> and
+    <a href="http://www.freebsd.org/cgi/man.cgi?query=zfs&apropos=0&sektion=8&manpath=FreeBSD+8-current&format=html">zfs(8)</a>: 
+
+    <ol>
+      <li><b>Snapshot Management Frontend:</b><br>
+          First, I've implemented a little utility 
+          <a href="snapshot.8.html">snapshot(8)</a>
+          (implementation peek: 
+          <a
+          href="snapshot"><tt>/usr/sbin/snapshot</tt></a>
+          and <a
+          href="snapshot.8"><tt>/usr/share/man/man8/snapshot.8</tt></a>)
+          which provides the convenience frontend for creating,
+          expiring, mounting and unmounting snapshots.
+      <p/>
+      <li><b>Periodic and Flexible Backup Snapshot Creation</b><br>
+          Second, I've implemented a periodic scheduler
+          <a href="periodic-snapshot.8.html">periodic-snapshot(8)</a>
+          (implementation peek: <a
+          href="periodic-snapshot"><tt>periodic-snapshot</tt></a> 
+          and <a
+          href="periodic-snapshot.8"><tt>/usr/share/man/man8/periodic-snapshot.8</tt></a>) which is called from <a
+          href="crontab"><tt>/etc/crontab</tt></a> (periodic(8)
+          cannot be used here because we need hourly runs and at exact
+          times to not confuse users) and runs the "<tt>snapshot
+          make</tt>" commands according to the configuration provided in
+          <a href="periodic.conf"><tt>/etc/periodic.conf</tt></a>.
+      <p/>
+      <li><b>Easy Access to Backup Snapshot Data</b><br>
+          Third, I've setup a amd(8) map <a
+          href="amd.map.snap"><tt>/etc/amd.map.snap</tt></a>
+          in <a href="rc.conf"><tt>/etc/rc.conf</tt></a> which
+          performs the "<tt>snapshot mount</tt>" and "<tt>snapshot
+          umount</tt>" commands when a user accesses directories under
+          <tt>/snap</tt>.
+    </ol>
+
+    In order to easily integrate this implementation into
+    a FreeBSD 7 installation, <b>DOWNLOAD</b> the latest tarball
+    <a href="../dist/"><b>HERE</b></a>
+    and install it as following:
+
+    <pre class="screenshot">
+# <span class="command">tar zxf freebsd-snapshot-*.tar.gz</span>
+# <span class="command">cd freebsd-snapshot-*</span>
+# <span class="command">make install</span>
+# <span class="command">/etc/rc.d/amd start</span>
+    </pre>
+
+    (If you later want to remove it again, just run "<tt>make uninstall</tt>")
+
+    <h1>References</h1>
+
+    See the following URLs for further details:
+
+    <ul>
+      <li><a href="http://www.freebsd.org/cgi/man.cgi?query=mount&apropos=0&sektion=0&manpath=FreeBSD+8-current&format=html">mount(8)</a></li>
+      <li><a href="http://www.freebsd.org/cgi/man.cgi?query=mksnap_ffs&apropos=0&sektion=0&manpath=FreeBSD+8-current&format=html">mksnap_ffs(8)</a></li>
+      <li><a href="http://www.freebsd.org/cgi/man.cgi?query=mdconfig&apropos=0&sektion=0&manpath=FreeBSD+8-current&format=html">mdconfig(8)</a></li>
+      <li><a href="http://www.freebsd.org/cgi/man.cgi?query=amd&apropos=0&sektion=0&manpath=FreeBSD+8-current&format=html">amd(8)</a></li>
+      <li><a href="http://www.freebsd.org/cgi/man.cgi?query=zfs&apropos=0&sektion=0&manpath=FreeBSD+8-current&format=html">zfs(8)</a></li>
+      <li><a href="http://www.freebsd.org/cgi/cvsweb.cgi/~checkout~/src/sys/ufs/ffs/README.snapshot">/usr/src/sys/ufs/ffs/README.snapshot</a></li>
+      <li><a href="http://www.mckusick.com/softdep/">http://www.mckusick.com/softdep/</a></li>
+      <li><a href="http://en.wikipedia.org/wiki/UFS">UFS</a></li>
+      <li><a href="http://en.wikipedia.org/wiki/ZFS">ZFS</a></li>
+    </ul>
+
+    </div>
+  </body>
+</html>

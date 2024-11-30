@@ -1,0 +1,569 @@
+#!/bin/sh
+##
+##  FreeBSD UFS/ZFS Snapshot Management Environment
+##  Copyright (c) 2004-2007 The FreeBSD Project. All rights reserved.
+##  
+##  Redistribution and use in source and binary forms, with or without
+##  modification, are permitted provided that the following conditions
+##  are met:
+##  1. Redistributions of source code must retain the above copyright
+##     notice, this list of conditions and the following disclaimer.
+##  2. Redistributions in binary form must reproduce the above copyright
+##     notice, this list of conditions and the following disclaimer in the
+##     documentation and/or other materials provided with the distribution.
+##  
+##  THIS SOFTWARE IS PROVIDED BY AUTHOR AND CONTRIBUTORS ``AS IS'' AND
+##  ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+##  IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+##  ARE DISCLAIMED.  IN NO EVENT SHALL AUTHOR OR CONTRIBUTORS BE LIABLE
+##  FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+##  DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
+##  OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
+##  HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
+##  LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
+##  OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
+##  SUCH DAMAGE.
+##
+##  snapshot: snapshot management utility (implementation)
+##  $FreeBSD$
+##
+
+#   make sure system tools are used first
+PATH="/bin:/usr/bin:/sbin:/usr/sbin:$PATH"
+
+#   option defaults
+verbose=no
+help=no
+
+#   command line parsing
+usage () {
+    echo "Usage: snapshot [<option> ...] <operation> <argument> ..."
+    echo "Global <option> arguments are:"
+    echo "    -v          enable verbose messages"
+    echo "    -h          display usage help (this message)"
+    echo "Operations <operations> and their arguments <argument> are:"
+    echo "    list   [<fs>]"
+    echo "    make   [-g <generations>] <fs>:<tag>[.<generation>]"
+    echo "    visit  <fs>:<tag>[.<generation>]"
+    echo "    mount  [-o <mount-option>] <fs>:<tag>[.<generation>] <dir>"
+    echo "    umount <dir>"
+}
+if [ $# -eq 0 ]; then
+    usage
+    exit 1
+fi
+args=`getopt vh $*`
+if [ $? != 0 ]; then
+    echo "snapshot:ERROR: invalid command line arguments" 1>&2
+    exit 2
+fi
+set -- $args
+for arg
+do
+    case "$arg" in
+        -v ) verbose=yes;    shift        ;;
+        -h ) help=yes;       shift        ;;
+        -- )                 shift; break ;;
+    esac    
+done
+if [ ".$help" = .yes ]; then
+    usage
+    exit 0
+fi
+
+#   explicitly check whether we should take care of ZFS to
+#   prevent us from _implicitly_ loading "zfs.ko" without reason
+zfs_enabled=`( \
+    if [ -r /etc/defaults/rc.conf ]; then \
+        . /etc/defaults/rc.conf; \
+        source_rc_confs; \
+    fi; \
+    . /etc/rc.subr; \
+    if checkyesno zfs_enable; then \
+        echo 'yes'; \
+    else \
+        echo 'no'; \
+    fi
+) 2>/dev/null || true`
+
+#   execute a system command
+system () {
+    if [ ".$verbose" = .yes ]; then
+        echo "+ $*" 1>&2
+    fi
+    eval "$@"
+}
+
+#   parse <fs>:<tag>[.<generation>] string into parts
+parseFTG () {
+    fs_dir=""; fs_tag=""; fs_gen="0"
+    eval `echo "$1" |\
+        sed -e 's/^/X/' \
+            -e 's/^X\([^:]*\):\(.*\)\.\([0-9][0-9]*\)$/fs_dir="\1"; fs_tag="\2"; fs_gen="\3"/' \
+            -e 's/^X\([^:]*\):\(.*\)$/fs_dir="\1"; fs_tag="\2"/' \
+            -e 's/^X.*/fs_dir=""/'`
+    if [ ".$fs_dir" = . ]; then
+        echo "snapshot:ERROR: invalid argument \"$1\"" 1>&2
+        exit 1
+    fi
+    if [ ".$fs_dir" = "./." ]; then
+        fs_dir="/"
+    fi
+}
+
+##
+##  LIST SNAPSHOTS
+##
+canonksize () {
+    size="$1"
+    case "$size" in
+        [0-9][0-9]* ) ;;
+        * ) size=0 ;;
+    esac
+    if [ $size -gt 1048576 ]; then
+        size="$(($size / 1048576))GB"
+    elif [ $size -gt 1024 ]; then
+        size="$(($size / 1024))MB"
+    else
+        size="${size}KB"
+    fi
+    echo "$size"
+}
+op_list () {
+    #   command line handling
+    if [ $# -ge 1 ]; then
+        fs_list="$*"
+    else
+        fs_list="`(mount -t ufs; mount -t zfs) 2>/dev/null | sed -e 's;^.*on \(/[^ ]*\).*$;\1;'`"
+    fi
+    
+    #   iterate over all filesystems
+    if [ ".$verbose" = .yes ]; then
+        printf "%-15s %4s %8s %7s %8s %7s  %-15s %s\n" "Filesystem" "Type" "User" "User%" "Snap" "Snap%" "Snapshot Name" "Snapshot Time"
+    else
+        printf "%-15s %8s %7s %8s %7s  %-15s\n" "Filesystem" "User" "User%" "Snap" "Snap%" "Snapshot"
+    fi
+    for fs_dir in $fs_list; do
+        #   make sure filesystem really is a directory
+        if [ ! -d $fs_dir ]; then
+            echo "snapshot:WARNING: filesystem \"$fs_dir\" not found" 1>&2
+            continue
+        fi
+        #   make sure filesystem isn't an already automounted snapshot
+        if [ -f /var/run/amd.pid ]; then
+            if kill -0 `cat /var/run/amd.pid` 2>/dev/null; then
+                if [ ".`amq $fs_dir 2>&1 | grep 'not automounted'`" = . ]; then
+                    continue
+                fi
+            fi
+        fi
+        if [ ".$zfs_enabled" = .yes ] && (zfs list $fs_dir) >/dev/null 2>&1; then
+            #   ZFS filesystem
+            fs_type="zfs"
+            zfs=`zfs list -H -o name $fs_dir`
+            for snap in `zfs list -H -t snapshot -o name | egrep "^$zfs@"`; do
+                #   determine sizes
+                fs_size=`df -k $fs_dir | tail -n1 | awk '{ print $2; }'`
+                used_size=`df -k $fs_dir | tail -n1 | awk '{ print $3; }'`
+                snap_size=`zfs get -H -o value used $snap | sed -e 's;\.[0-9][0-9]*;;'`
+                case "$snap_size" in
+                    *B ) snap_size=`echo "$snap_size" | sed -e 's;B$;;'`; snap_size=$(($snap_size / 1024))               ;;
+                    *K ) snap_size=`echo "$snap_size" | sed -e 's;K$;;'`                                                 ;;
+                    *M ) snap_size=`echo "$snap_size" | sed -e 's;M$;;'`; snap_size=$(($snap_size * 1024))               ;;
+                    *G ) snap_size=`echo "$snap_size" | sed -e 's;G$;;'`; snap_size=$(($snap_size * 1024 * 1024))        ;;
+                    *T ) snap_size=`echo "$snap_size" | sed -e 's;T$;;'`; snap_size=$(($snap_size * 1024 * 1024 * 1024)) ;;
+                esac
+
+                #   determine snapshot creation time
+                if [ ".$verbose" = .yes ]; then
+                    snap_time=`zfs get -H -o value creation $snap`
+                    snap_time=`date -j -f "%a %b %d %H:%M %Y" "$snap_time" "+%Y-%m-%dT%H:%M"`
+                fi
+    
+                #   calculate percentages
+                snap_percent=`echo . | awk '{ printf("%.1f%%", (snap / fs) * 100); }' snap="$snap_size" fs="$fs_size"`
+                used_percent=`echo . | awk '{ printf("%.1f%%", (used / fs) * 100); }' used="$used_size" fs="$fs_size"`
+    
+                #   canonicalize for output
+                fs_size=`canonksize $fs_size`
+                snap_size=`canonksize $snap_size`
+                used_size=`canonksize $used_size`
+                snap_file=`echo "$snap" | sed -e 's;.*@;;'`
+
+                #   output snapshot information
+                if [ ".$verbose" = .yes ]; then
+                    printf "%-15s %4s %8s %7s %8s %7s  %-15s %s\n" \
+                        "$fs_dir" "$fs_type" "$used_size" "$used_percent" "$snap_size" "$snap_percent" "$snap_file" "$snap_time"
+                else
+                    printf "%-15s %8s %7s %8s %7s  %-15s\n" \
+                        "$fs_dir" "$used_size" "$used_percent" "$snap_size" "$snap_percent" "$snap_file"
+                fi
+            done
+        else
+            #   UFS filesystem
+            fs_type="ufs"
+            for snap in `snapinfo $fs_dir 2>/dev/null`; do
+                if [ ! -f $snap ]; then
+                    continue
+                fi
+
+                #   determine sizes
+                fs_size=`df -k $fs_dir | tail -n1 | awk '{ print $2; }'`
+                used_size=`df -k $fs_dir | tail -n1 | awk '{ print $3; }'`
+                snap_size=`du -k $snap | awk '{ print $1; }'`
+
+                #   determine snapshot creation time
+                if [ ".$verbose" = .yes ]; then
+                    snap_time=`stat -f "%B" $snap`
+                    snap_time=`date -r "$snap_time" "+%Y-%m-%dT%H:%M"`
+                fi
+    
+                #   calculate percentages
+                snap_percent=`echo . | awk '{ printf("%.1f%%", (snap / fs) * 100); }' snap="$snap_size" fs="$fs_size"`
+                used_percent=`echo . | awk '{ printf("%.1f%%", (used / fs) * 100); }' used="$used_size" fs="$fs_size"`
+    
+                #   canonicalize for output
+                fs_size=`canonksize $fs_size`
+                snap_size=`canonksize $snap_size`
+                used_size=`canonksize $used_size`
+                snap_file=`echo "$snap" | sed -e 's;.*/\([^/]*\)$;\1;'`
+    
+                #   output snapshot information
+                if [ ".$verbose" = .yes ]; then
+                    printf "%-15s %4s %8s %7s %8s %7s  %-15s %s\n" \
+                        "$fs_dir" "$fs_type" "$used_size" "$used_percent" "$snap_size" "$snap_percent" "$snap_file" "$snap_time"
+                else
+                    printf "%-15s %8s %7s %8s %7s  %-15s\n" \
+                        "$fs_dir" "$used_size" "$used_percent" "$snap_size" "$snap_percent" "$snap_file"
+                fi
+            done
+        fi
+    done
+
+    return 0
+}
+
+##
+##  MAKE SNAPSHOT (AND EXPIRE OLD ONES)
+##
+op_make () {
+    #   command line handling
+    maxgen=20
+    args=`getopt g: $*`
+    if [ $? != 0 ]; then
+        echo "snapshot:ERROR: invalid command line arguments to \"$op\" operation" 1>&2
+        exit 2
+    fi
+    set -- $args
+    for arg
+    do
+        case "$arg" in
+            -g ) maxgen="$2"; shift; shift ;;
+            -- ) shift; break ;;
+        esac    
+    done
+    if [ $# -ne 1 ]; then
+        echo "snapshot:ERROR: invalid number of arguments to \"$op\" operation" 1>&2
+        exit 1
+    fi
+    fs="$1"
+
+    #   parse filesystem argument into fs_dir/fs_tag/fs_gen
+    parseFTG "$fs"
+
+    #   argument consistency check
+    if [ $fs_gen -gt $maxgen ]; then
+        echo "snapshot:ERROR: new snapshot generation ($fs_gen) exceeds maximum number of generations ($maxgen)" 1>&2
+        exit 1
+    fi
+
+    #   operate on filesystem
+    if [ ".$zfs_enabled" = .yes ] && (zfs list $fs_dir) >/dev/null 2>&1; then
+        #   ZFS filesystem
+        fs_name=`zfs list -H -o name $fs_dir`
+
+        #   remove no longer wished snapshots
+        i=19
+        k=`expr $maxgen - 1`
+        while [ $i -gt $k ]; do
+            if zfs list -t snapshot "$fs_name@$fs_tag.$i" >/dev/null 2>&1; then
+                system zfs destroy "$fs_name@$fs_tag.$i"
+            fi
+            i=`expr $i - 1`
+        done
+
+        if [ $maxgen -gt 0 ]; then
+            #   rotate remaining snapshots
+            i=$k
+            if zfs list -t snapshot "$fs_name@$fs_tag.$i" >/dev/null 2>&1; then
+                system zfs destroy "$fs_name@$fs_tag.$i"
+            fi
+            i=`expr $i - 1`
+            while [ $i -ge $fs_gen ]; do
+                if zfs list -t snapshot "$fs_name@$fs_tag.$i" >/dev/null 2>&1; then
+                    j=`expr $i + 1`
+                    system zfs rename "$fs_name@$fs_tag.$i" "$fs_name@$fs_tag.$j"
+                fi
+                i=`expr $i - 1`
+            done
+
+            #   create new snapshot
+            system zfs snapshot "$fs_name@$fs_tag.$fs_gen"
+            if [ $? -ne 0 ]; then
+                echo "snapshot:ERROR: making ZFS snapshot failed" 1>&2
+                exit 1
+            fi
+        fi
+    else
+        #   UFS filesystem 
+
+        #   make sure filesystem snapshot sub-directory exists
+        if [ ! -d $fs_dir/.snap ]; then
+            system mkdir $fs_dir/.snap || exit $?
+            system chmod 775 $fs_dir/.snap || exit $?
+            system chown root:operator $fs_dir/.snap || exit $?
+        fi
+
+        #   remove no longer wished snapshots
+        if [ $maxgen -gt 20 ]; then
+            echo "snapshot:ERROR: number of generations ($maxgen) exceed maximum on UFS (20)" 1>&2
+            exit 1
+        fi
+        i=19
+        k=`expr $maxgen - 1`
+        while [ $i -gt $k ]; do
+            if [ -f $fs_dir/.snap/$fs_tag.$i ]; then
+                system rm -f $fs_dir/.snap/$fs_tag.$i
+            fi
+            i=`expr $i - 1`
+        done
+
+        if [ $maxgen -gt 0 ]; then
+            #   rotate remaining snapshots
+            i=$k
+            if [ -f $fs_dir/.snap/$fs_tag.$i ]; then
+                system rm -f $fs_dir/.snap/$fs_tag.$i
+            fi
+            i=`expr $i - 1`
+            while [ $i -ge $fs_gen ]; do
+                if [ -f $fs_dir/.snap/$fs_tag.$i ]; then
+                    j=`expr $i + 1`
+                    system mv $fs_dir/.snap/$fs_tag.$i $fs_dir/.snap/$fs_tag.$j
+                fi
+                i=`expr $i - 1`
+            done
+
+            #   create new snapshot
+            system mount -u -o snapshot $fs_dir/.snap/$fs_tag.$fs_gen $fs_dir
+            if [ $? -ne 0 ]; then
+                echo "snapshot:ERROR: making UFS snapshot failed" 1>&2
+                exit 1
+            fi
+        fi
+    fi
+
+    return 0
+}
+
+##
+##  VISIT A SNAPSHOT WITH AN INTERACTIVE SHELL
+##
+op_visit () {
+    #   command line handling
+    if [ $# -ne 1 ]; then
+        echo "snapshot:ERROR: invalid number of arguments to \"$op\" operation" 1>&2
+        exit 1
+    fi
+    fs="$1"
+
+    #   parse filesystem argument into fs_dir/fs_tag/fs_gen
+    parseFTG "$fs"
+
+    #   operate on filesystem
+    if [ ".$zfs_enabled" = .yes ] && (zfs list $fs_dir) >/dev/null 2>&1; then
+        #   ZFS filesystem
+
+        #   check for existence of snapshot
+        if [ ! -d $fs_dir/.zfs/snapshot/$fs_tag.$fs_gen ]; then
+            echo "snapshot:ERROR: no such snapshot \"$fs_tag.$fs_gen\" on filesystem \"$fs_dir\"" 1>&2
+            exit 1
+        fi
+    else
+        #   UFS filesystem
+
+        #   check for existence of snapshot
+        if [ ! -f $fs_dir/.snap/$fs_tag.$fs_gen ]; then
+            echo "snapshot:ERROR: no such snapshot \"$fs_tag.$fs_gen\" on filesystem \"$fs_dir\"" 1>&2
+            exit 1
+        fi
+    fi
+
+    #   mount snapshot
+    op_mount $fs_dir:$fs_tag.$fs_gen /mnt
+
+    #   enter interactive shell
+    oldpwd=`pwd`
+    system cd /mnt || exit $?
+    system ${SHELL-"/bin/sh"}
+    system cd $oldpwd
+    
+    #   unmount snapshot
+    op_umount /mnt
+
+    return 0
+}
+
+##
+##  MOUNT A SNAPSHOT
+##
+op_mount () {
+    #   command line handling
+    mntopt=""
+    args=`getopt o: $*`
+    if [ $? != 0 ]; then
+        echo "snapshot:ERROR: invalid command line arguments to \"$op\" operation" 1>&2
+        exit 2
+    fi
+    set -- $args
+    for arg
+    do
+        case "$arg" in
+            -o ) mntopt="$mntopt -o \"$2\""; shift; shift ;;
+            -- ) shift; break ;;
+        esac    
+    done
+    if [ $# -ne 2 ]; then
+        echo "snapshot:ERROR: invalid number of arguments to \"$op\" operation" 1>&2
+        exit 1
+    fi
+    fs="$1"
+    mnt="$2"
+
+    #   parse filesystem argument into fs_dir/fs_tag/fs_gen
+    parseFTG "$fs"
+
+    #   operate on filesystem
+    if [ ".$zfs_enabled" = .yes ] && (zfs list $fs_dir) >/dev/null 2>&1; then
+        #   ZFS filesystem
+
+        #   check for existence of snapshot
+        if [ ! -d $fs_dir/.zfs/snapshot/$fs_tag.$fs_gen ]; then
+            echo "snapshot:ERROR: no such snapshot \"$fs_tag.$fs_gen\" on filesystem \"$fs_dir\"" 1>&2
+            exit 1
+        fi
+
+        #   mount snapshot
+        if [ ! -d $mnt ]; then
+            system mkdir -p $mnt
+        fi
+        if [ $? -ne 0 ]; then
+            echo "snapshot:ERROR: unable to create directory \"$mnt\"" 1>&2
+            exit 1
+        fi
+        system mount -t nullfs -o ro $fs_dir/.zfs/snapshot/$fs_tag.$fs_gen $mnt
+        if [ $? -ne 0 ]; then
+            echo "snapshot:ERROR: unable to mount \"$fs_dir/.zfs/snapshot/$fs_tag.$fs_gen\" under \"$mnt\"" 1>&2
+            exit 1
+        fi
+    else
+        #   UFS filesystem
+
+        #   check for existence of snapshot
+        if [ ! -f $fs_dir/.snap/$fs_tag.$fs_gen ]; then
+            echo "snapshot:ERROR: no such snapshot \"$fs_tag.$fs_gen\" on filesystem \"$fs_dir\"" 1>&2
+            exit 1
+        fi
+
+        #   determine next free md(4) device
+        num=0
+        while [ $num -le 99 ]; do
+            if ! mdconfig -l -u $num >/dev/null 2>&1; then
+                break
+            fi
+            num=`expr $num + 1`
+        done
+
+        #   mount snapshot
+        if [ ! -d $mnt ]; then
+            system mkdir -p $mnt
+        fi
+        if [ $? -ne 0 ]; then
+            echo "snapshot:ERROR: unable to create directory \"$mnt\"" 1>&2
+            exit 1
+        fi
+        system mdconfig -a -t vnode -f $fs_dir/.snap/$fs_tag.$fs_gen -u $num
+        if [ $? -ne 0 ]; then
+            echo "snapshot:ERROR: unable to attach \"$fs_dir/.snap/$fs_tag.$fs_gen\" to \"/dev/md$num\"" 1>&2
+            exit 1
+        fi
+        system mount -o ro $mntopt /dev/md$num $mnt
+        if [ $? -ne 0 ]; then
+            mdconfig -d -u $num 2>/dev/null || true
+            echo "snapshot:ERROR: unable to mount \"/dev/md$num\" under \"$mnt\"" 1>&2
+            exit 1
+        fi
+    fi
+
+    return 0
+}
+
+##
+##  UNMOUNT A SNAPSHOT
+##
+op_umount () {
+    #   command line handling
+    if [ $# -ne 1 ]; then
+        echo "snapshot:ERROR: invalid number of arguments to \"$op\" operation" 1>&2
+        exit 1
+    fi
+    mnt="$1"
+
+    #   argument sanity check
+    if [ ! -d $mnt ]; then
+        echo "snapshot:ERROR: no such mounted snapshot directory \"$mnt\" to unmount" 1>&2
+        exit 1
+    fi
+
+    #   unmount snapshot
+    src=`df $mnt | tail -n1 | awk '{ print $1; }'`
+    md_num=`echo "$src" | sed -e 's;^;X;' -e 's;^X/dev/md;;' -e 's;^X.*;;'`
+    system umount $mnt
+    if [ $? -ne 0 ]; then
+        echo "snapshot:ERROR: unable to unmount \"/dev/md$num\" from \"$mnt\"" 1>&2
+        exit 1
+    fi
+    if [ ".$md_num" != . ]; then
+        #   remove UFS md(4) device
+        system mdconfig -d -u $md_num
+        if [ $? -ne 0 ]; then
+            echo "snapshot:ERROR: unable to dettach \"$fs_dir/.snap/$fs_tag.$fs_gen\" from \"/dev/md$md_num\"" 1>&2
+            exit 1
+        fi
+    fi
+    if [ ".`echo $src | fgrep /.zfs/snapshot/`" != . ]; then
+        #   unmount implicitly mounted ZFS snapshot directory
+        system umount $src
+        if [ $? -ne 0 ]; then
+            echo "snapshot:ERROR: unmounting ZFS snapshot failed" 1>&2
+            exit 1
+        fi
+    fi
+
+    return 0
+}
+
+#   dispatch into operations
+op="$1"
+shift
+case "$op" in
+    list   ) op_list   "$@"; exit $? ;;
+    make   ) op_make   "$@"; exit $? ;;
+    visit  ) op_visit  "$@"; exit $? ;;
+    mount  ) op_mount  "$@"; exit $? ;;
+    umount ) op_umount "$@"; exit $? ;;
+    * )
+        echo "snapshot:ERROR: invalid operation \"$op\"" 1>&2
+        exit 1
+        ;;
+esac
+

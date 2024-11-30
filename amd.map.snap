@@ -1,0 +1,8 @@
+##
+##  amd.map.snap -- AMD map for /snap FreeBSD UFS/ZFS snapshot access area
+##
+
+/defaults type:=program
+*         mount:="/usr/sbin/snapshot snapshot mount /`echo ${key} | /usr/bin/sed -e 's;+;/;g'` ${fs}";\
+          unmount:="/usr/sbin/snapshot snapshot umount ${fs}"
+
