@@ -3,6 +3,6 @@
 ##
 
 /defaults type:=program
-*         mount:="/usr/sbin/snapshot snapshot mount /`echo ${key} | /usr/bin/sed -e 's;+;/;g'` ${fs}";\
-          unmount:="/usr/sbin/snapshot snapshot umount ${fs}"
+*         mount:="%%PREFIX%%/sbin/snapshot snapshot mount /`echo ${key} | /usr/bin/sed -e 's;+;/;g'` ${fs}";\
+          unmount:="%%PREFIX%%/sbin/snapshot snapshot umount ${fs}"
 
