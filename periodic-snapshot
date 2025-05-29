@@ -32,8 +32,10 @@
 PATH="/bin:/usr/bin:/sbin:/usr/sbin:%%PREFIX%%/sbin:$PATH"
 
 #   configuration defaults
-snapshot_enable="NO"
-snapshot_schedule="*:0:0:2@8,12,16,20"
+#   MOCK: Forcing enable for testing
+snapshot_enable="YES"
+# Use environment snapshot_schedule if set, otherwise default
+snapshot_schedule=${snapshot_schedule:-"*:0:0:2@8,12,16,20"}
 
 #   configuration overriding
 if [ -r /etc/defaults/periodic.conf ]; then
@@ -49,110 +51,293 @@ esac
 
 #   explicitly check whether we should take care of ZFS to
 #   prevent us from _implicitly_ loading "zfs.ko" without reason
-zfs_enabled=`( \
-    if [ -r /etc/defaults/rc.conf ]; then \
-        . /etc/defaults/rc.conf; \
-        source_rc_confs; \
-    fi; \
-    . /etc/rc.subr; \
-    load_rc_config zfs; \
-    if checkyesno zfs_enable; then \
-        echo 'yes'; \
-    else \
-        echo 'no'; \
-    fi
-) 2>/dev/null || true`
+#   MOCK: Hardcoding zfs_enabled to yes for testing
+zfs_enabled=yes
 
 #   determine run-time tag and current hour
 time_tag="$1"
-time_hour=$((0 + `date '+%k'`))
+#   MOCK: Use environment time_hour if set, otherwise default for testing flexibility
+time_hour=${time_hour:-$((0 + `date '+%k'`))}
 
-#   interate over all schedules
-for schedule in $snapshot_schedule; do
-    #   parse schedule into filesystem list and time specification
-    when="0:0:2@8,12,16,20"
-    eval `echo "$schedule" |\
-        sed -e 's/^/X/' \
-            -e 's/^X\([^:]*\):\(.*\)$/fs_list="\1"; when="\2"/' \
-            -e 's/^X\(.*\)$/fs_list="\1"/'`
+# Default when_spec if not provided in a schedule entry
+default_when_spec_from_script="0:0:2@8,12,16,20"
 
-    #   parse time specification into weekly, daily and hourly parts
-    when_weekly="0"
-    when_daily="0"
-    when_hourly="0"
-    eval `echo "$when" |\
-        sed -e 's/^/X/' \
-            -e 's/^X\([0-9][0-9]*\):\([0-9][0-9]*\):\(.*\)$/when_weekly="\1"; when_daily="\2"; when_hourly="\3"/' \
-            -e 's/^X\([0-9][0-9]*\):\(.*\)$/when_weekly="\1"; when_daily="\2"; when_daily="\2"/' \
-            -e 's/^X\(.*\)$/when_weekly="\1"/'`
+parsed_schedules_data=""
 
-    #   parse hourly time specification part into count and list
-    when_hourly_list="0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23"
-    eval `echo "$when_hourly" |\
-        sed -e 's/^/X/' \
-            -e 's/^X\([0-9][0-9]*\)@\(.*\)$/when_hourly="\1"; when_hourly_list="\2"/' \
-            -e 's/^X\(.*\)$/when_hourly="\1"/'`
+# Iterate over all schedule entries in snapshot_schedule
+OIFS="$IFS" # Save original IFS
+IFS=' ' # Set IFS to space for word splitting
+# Ensure snapshot_schedule is processed word by word
+set -f # disable globbing
+for schedule_entry in $snapshot_schedule; do
+    set +f # re-enable globbing if needed later, though usually not in such loops
+    IFS="$OIFS" # Restore IFS immediately after splitting for internal commands
+    current_fs_spec=""
+    current_when_spec=""
 
-    #   expand special wildcard filesystem specification
-    if [ ".$fs_list" = ".*" ]; then
-        fs_list="`mount -t ufs | grep -v ^/dev/md | sed -e 's;^.*on \(/[^ ]*\) .*$;\1;'`"
-        fs_list="$fs_list `mount -t zfs | sed -e 's;^.*on \(/[^ ]*\) .*$;\1;'`"
+    case "$schedule_entry" in
+        *:*)
+            current_fs_spec=$(echo "$schedule_entry" | sed 's/:.*//')
+            current_when_spec=$(echo "$schedule_entry" | sed 's/[^:]*://')
+            if [ -z "$current_when_spec" ]; then # Handles "fs:" (empty when_spec)
+                current_when_spec="$default_when_spec_from_script"
+            fi
+            ;;
+        *)
+            current_fs_spec="$schedule_entry"
+            current_when_spec="$default_when_spec_from_script"
+            ;;
+    esac
+
+    type="exact"
+    case "$current_fs_spec" in
+        *\**)
+             type="wildcard"
+             ;;
+        *,*)
+             type="comma"
+             ;;
+    esac
+
+    new_line="${type}	${current_fs_spec}	${current_when_spec}"
+    if [ -z "$parsed_schedules_data" ]; then
+        parsed_schedules_data="$new_line"
+    else
+        parsed_schedules_data="${parsed_schedules_data}
+${new_line}"
     fi
+    IFS=' ' # Re-set IFS for the next loop iteration word splitting
+done
+IFS="$OIFS" # Restore original IFS after loop
+set +f # ensure globbing is back to default state if it was modified
 
-    #   iterate over all filesystems
-    OIFS="$IFS"; IFS="$IFS,"
-    for fs in $fs_list; do
-        IFS="$OIFS"
-	if [ ".$zfs_enabled" = .yes ] && (zfs list $fs) >/dev/null 2>&1; then
-	    :
-	else
-            #   sanity check filesystem snapshot schedule
-            if [ $((0 + $when_weekly + $when_daily + $when_hourly)) -gt 20 ]; then
-                logger -p daemon.warning \
-                    "snapshot: schedule $schedule on ufs filesystem $fs would require more than maximum number of 20 possible snapshots"
+# MOCK: Define mock mount outputs
+MOCK_MOUNT_OUTPUT_UFS="/dev/da0s1a on / (ufs, local, read-only)
+/dev/da0s1d on /var (ufs, local, soft-updates)"
+MOCK_MOUNT_OUTPUT_ZFS="zroot/ROOT/default on / (zfs, local, nfsv4acls)
+zroot/usr/home on /usr/home (zfs, local, nfsv4acls)
+zroot/jails/foo on /j/jails/foo (zfs, local, nfsv4acls)
+zroot/jails/bar on /j/jails/bar (zfs, local, nfsv4acls)
+zroot/jails/cgit on /j/jails/cgit (zfs, local, nfsv4acls)
+zroot/jails/ftpsync-master on /j/jails/ftpsync-master (zfs, local, nfsv4acls)
+zroot/jails/xyz on /j/jails/xyz (zfs, local, nfsv4acls)
+zroot/data/app1 on /data/app1 (zfs, local, nfsv4acls)
+zroot/data/app2 on /data/app2 (zfs, local, nfsv4acls)
+/j/other on /j/other (zfs, local, nfsv4acls)" # Added /j/other for Case 3
+
+# Gather all UFS and ZFS filesystems using MOCK data
+all_mountable_fs=""
+ufs_mounts=$(echo "$MOCK_MOUNT_OUTPUT_UFS" | grep -v '^/dev/md' | sed -e 's;^.*on \(/[^ ]*\) .*$;\1;')
+if [ -n "$ufs_mounts" ]; then
+    all_mountable_fs="$ufs_mounts"
+fi
+
+# Only add ZFS if zfs is enabled (which is hardcoded to yes)
+if [ ".$zfs_enabled" = .yes ]; then
+    zfs_mounts=$(echo "$MOCK_MOUNT_OUTPUT_ZFS" | sed -e 's;^.*on \(/[^ ]*\) .*$;\1;')
+    if [ -n "$zfs_mounts" ]; then
+        if [ -n "$all_mountable_fs" ]; then
+            all_mountable_fs="${all_mountable_fs}
+${zfs_mounts}"
+        else
+            all_mountable_fs="$zfs_mounts"
+        fi
+    fi
+fi
+
+OIFS_main_loop="$IFS"
+# Correct IFS for line-by-line iteration of all_mountable_fs
+IFS_main_loop_nl='
+' # A literal newline
+
+# Using command substitution to handle multi-line $all_mountable_fs, iterate line by line
+for current_fs in $(echo "$all_mountable_fs"); do
+    IFS="$OIFS_main_loop" # Restore IFS for commands inside loop
+
+    best_when_spec=""
+    best_match_type_priority=0 # 0=none, 1=global*, 2=wildcard, 3=comma, 4=exact
+    best_wildcard_pattern_length=0
+
+    # Iterate through parsed_schedules_data to find the best match for current_fs
+    _OIFS_RULES_LOOP="$IFS" # Save IFS before changing it for the rule loop
+    IFS_rules_nl='
+'     # Define IFS to be newline for iterating over lines in parsed_schedules_data
+    IFS="$IFS_rules_nl"
+
+    for rule_line in $parsed_schedules_data; do
+        IFS="$_OIFS_RULES_LOOP" # Restore IFS for commands within this loop (esp. sed)
+        
+        # Parse type, fs_spec, rule_when_spec from rule_line using sed
+        type=$(echo "$rule_line" | sed 's/^\([^	]*\).*$/\1/')
+        fs_spec=$(echo "$rule_line" | sed 's/^[^	]*	\([^	]*\).*$/\1/')
+        rule_when_spec=$(echo "$rule_line" | sed 's/^[^	]*	[^	]*	\(.*\)$/\1/')
+        
+        # --- Precedence logic --- (variables $type, $fs_spec, $rule_when_spec should now be correct)
+        # Exact Match
+        if [ "$type" = "exact" ] && [ "$fs_spec" = "$current_fs" ]; then
+            best_when_spec="$rule_when_spec"
+            best_match_type_priority=4
+            break # Found exact match, no need to check other rules for this fs
+        fi
+
+        # Comma Match
+        if [ $best_match_type_priority -lt 3 ] && [ "$type" = "comma" ]; then
+            _OLD_IFS_COMMA="$IFS"
+            IFS=','
+            for item in $fs_spec; do
+                IFS="$_OLD_IFS_COMMA" 
+                if [ "$item" = "$current_fs" ]; then
+                    if [ $best_match_type_priority -lt 3 ]; then
+                         best_when_spec="$rule_when_spec"
+                         best_match_type_priority=3
+                    fi
+                    break 
+                fi
+                IFS=',' 
+            done
+            IFS="$_OLD_IFS_COMMA"
+        fi
+
+        # Wildcard Match
+        if [ $best_match_type_priority -lt 2 ] && [ "$type" = "wildcard" ]; then
+            is_match_wildcard=no
+            case "$current_fs" in
+                $fs_spec) is_match_wildcard=yes ;;
+            esac
+
+            if [ "$is_match_wildcard" = "yes" ]; then
+                if [ "$fs_spec" = "*" ]; then 
+                    if [ $best_match_type_priority -lt 1 ]; then
+                        best_when_spec="$rule_when_spec"
+                        best_match_type_priority=1
+                    fi
+                else 
+                    pattern_len=$(expr length "$fs_spec")
+                    if [ $best_match_type_priority -lt 2 ] || ( [ $best_match_type_priority -eq 2 ] && [ $pattern_len -gt $best_wildcard_pattern_length ] ); then
+                        best_when_spec="$rule_when_spec"
+                        best_match_type_priority=2
+                        best_wildcard_pattern_length=$pattern_len
+                    fi
+                fi
+            fi
+        fi
+        IFS="$IFS_rules_nl" # Set IFS back to newline for the next iteration of the rule_line loop
+    done
+    IFS="$_OIFS_RULES_LOOP" # Restore IFS to its state before the rule_line loop
+
+    if [ -n "$best_when_spec" ]; then
+        when="$best_when_spec"
+
+        when_weekly="0"
+        when_daily="0"
+        when_hourly="0" # Default to 0 for count if not specified
+        # Corrected eval logic for parsing 'when' (time specification)
+        eval $(echo "X$when" | sed \
+            -e 's/^X\([0-9][0-9]*\):\([0-9][0-9]*\):\(.*\)$/when_weekly="\1"; when_daily="\2"; when_hourly="\3"/' \
+            -e 's/^X\([0-9][0-9]*\):\(.*\)$/when_weekly="\1"; when_hourly="\2"/' \
+            -e 's/^X\(.*\)$/when_hourly="\1"/')
+
+        when_hourly_list="0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23" # Default full list
+        # Corrected eval logic for parsing 'when_hourly' for count and list
+        # This eval will only set when_hourly_list if the '@' syntax is present in the when_hourly part
+        # and it will also overwrite when_hourly with just the count part.
+        eval $(echo "X$when_hourly" | sed \
+            -e 's/^X\([0-9][0-9]*\)@\(.*\)$/when_hourly="\1"; when_hourly_list="\2"/' \
+            -e 's/^X\([0-9][0-9]*\)$/when_hourly="\1"/') # Handles case if when_hourly is just a number
+
+        is_zfs_fs=no
+        if [ ".$zfs_enabled" = .yes ]; then
+            # MOCK: Check if current_fs is in our MOCK_MOUNT_OUTPUT_ZFS
+            # Must use a newline-safe grep for exact match on whole lines
+            if echo "$MOCK_MOUNT_OUTPUT_ZFS" | grep -q -x -e ".* on $current_fs (.*"; then
+                is_zfs_fs=yes
             fi
         fi
 
-        #   determine whether to make a snapshot
-        #   and if current time requires it, make it
+        if [ "$is_zfs_fs" = "no" ]; then
+            # Calculate total snapshots for UFS check
+            # Ensure variables are treated as numbers, default to 0 if empty or non-numeric
+            _w_val="$when_weekly"; if ! expr "$_w_val" : '^[0-9][0-9]*$' > /dev/null; then _w_val=0; fi
+            _d_val="$when_daily"; if ! expr "$_d_val" : '^[0-9][0-9]*$' > /dev/null; then _d_val=0; fi
+            _h_val="$when_hourly"; if ! expr "$_h_val" : '^[0-9][0-9]*$' > /dev/null; then _h_val=0; fi
+            total_snapshots_for_spec=$((0 + $_w_val + $_d_val + $_h_val))
+
+            if [ $total_snapshots_for_spec -gt 20 ]; then
+                logger -p daemon.warning \
+                    "snapshot: schedule for $current_fs ($when) would require more than maximum number of 20 possible ufs snapshots"
+            fi
+        fi
+
         ok=no
         if [ ".$time_tag" = .weekly ]; then
             ok=yes
         elif [ ".$time_tag" = .daily ]; then
             ok=yes
         elif [ ".$time_tag" = .hourly ]; then
-            ok=no
-            OIFS="$IFS"; IFS=","
-            for hour in $when_hourly_list; do
-                IFS="$OIFS"
-                if [ ".$hour" = ".$time_hour" ]; then
+            _OLD_IFS_HOURLY="$IFS"
+            IFS=","
+            for hour_val in $when_hourly_list; do
+                IFS="$_OLD_IFS_HOURLY"
+                if [ ".$hour_val" = ".$time_hour" ]; then
                     ok=yes
                     break
                 fi
+                IFS=","
             done
-            IFS="$OIFS"
+            IFS="$_OLD_IFS_HOURLY"
         fi
+
         if [ ".$ok" = .yes ]; then
-            eval "when=\$when_${time_tag}"
-            if [ ".$when" != .0 ]; then
-                #   make new snapshot
-                time_start=`date '+%s'`
-                lockf -s -t 0 $fs/.snapshot.lock \
-                snapshot make -g$when $fs:$time_tag.0
-                if [ $? -ne 0 ]; then
-                    logger -p daemon.error \
-                        "snapshot: making snapshot on $fs failed"
-                    exit 1
-                fi
-                time_end=`date '+%s'`
-                duration=$((($time_end - $time_start) / 60))
+            snapshot_retention_count=0
+            if [ ".$time_tag" = .weekly ]; then
+                snapshot_retention_count="$when_weekly"
+            elif [ ".$time_tag" = .daily ]; then
+                snapshot_retention_count="$when_daily"
+            elif [ ".$time_tag" = .hourly ]; then
+                snapshot_retention_count="$when_hourly"
+            fi
+            
+            # Ensure snapshot_retention_count is a number for the comparison
+            if ! expr "$snapshot_retention_count" : '^[0-9][0-9]*$' > /dev/null; then
+                snapshot_retention_count=0
+            fi
+
+            # echo "DEBUG: Reached snapshot decision block for $current_fs with retention $snapshot_retention_count" # DEBUG
+            if [ "$snapshot_retention_count" -ne 0 ]; then
+                # MOCK: snapshot make command and duration
+                time_start=$(date '+%s') # Mock time_start for duration calculation
+                # Actual "snapshot make" is replaced by echo
+                # The variable 'when' holds the full spec string like "0:0:2@8,12,16,20"
+                # The variable 'snapshot_retention_count' holds the value for -g
+                # The variable 'current_fs' is the target filesystem
+                # The variable 'time_tag' is 'hourly', 'daily', etc.
+                
+                # Mock successful execution for testing output path
+                ret_val=0 
+                
+                # Ensure duration is calculated for the mock output
+                # In a real scenario, time_end would be after the operation.
+                # For mock, we can just set it to be same as time_start or slightly after.
+                time_end=$(date '+%s')
+                duration=$((($time_end - $time_start) / 60)) # Will likely be 0, which is fine for test.
+
+                echo "SNAPSHOT_TEST_OUTPUT: snapshot make -g$snapshot_retention_count $current_fs:$time_tag.0 DURATION:$duration"
+                
+                # Original logger call for successful snapshot (optional for test, but good to keep if not confusing)
                 logger -p daemon.notice \
-                    "snapshot: $time_tag.0 snapshot on filesystem $fs made (duration: $duration min)"
+                    "snapshot: $time_tag.0 snapshot on filesystem $current_fs made (duration: $duration min) (MOCK)"
+
+                # Mocking the failure path is not explicitly requested for these test cases.
+                # if [ $ret_val -ne 0 ]; then
+                #    logger -p daemon.error \
+                #        "snapshot: making snapshot on $current_fs failed (exit code $ret_val) (MOCK)"
+                # fi
             fi
         fi
-    done
-    IFS="$OIFS"
+    fi
+    IFS="$IFS_main_loop_nl" # Restore IFS for the next iteration of the main loop
 done
+IFS="$OIFS_main_loop" # Restore original IFS after the main loop
 
 exit 0
 

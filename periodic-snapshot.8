@@ -73,23 +73,70 @@ snapshot_schedule=""
 .Pp
 The
 .Va snapshot_schedule
-variable values have to conform to the following grammar:
+variable consists of a space-separated list of schedule rules.
+Each rule defines a snapshot policy for one or more filesystems.
+If a filesystem matches multiple rules, the most specific rule applies based on
+precedence. The general format for each rule is:
 .Bd -literal -offset indent
-<schedule>    ::= <entry>*
-<entry>       ::= <fs> ("," <fs>)* ":" <spec>
-<fs>          ::= /^\/.*$/
-<spec>        ::= <gen_weekly> ":" <gen_daily> ":" <gen_hourly>
+<fs_spec>:<when_spec>
+.Ed
+.Pp
+If
+.Cm :<when_spec>
+is omitted, a default time specification of
+.Cm 0:0:2@8,12,16,20
+is used for that rule.
+.Pp
+The components are defined as follows:
+.Bd -literal -offset indent
+<fs_spec>     ::= <path_exact> | <path_comma_list> | <path_wildcard>
+<path_exact>  ::= /^\/.*$/
+                (e.g., "/jails/myjail")
+<path_comma_list> ::= <path_exact> ("," <path_exact>)*
+                (e.g., "/jails/foo,/jails/bar")
+<path_wildcard> ::= /^\/.*\*$/
+                (e.g., "/jails/*", or simply "*" for all filesystems)
+
+<when_spec>   ::= <gen_weekly> ":" <gen_daily> ":" <gen_hourly>
 <gen_weekly>  ::= <generation>
 <gen_daily>   ::= <generation>
 <gen_hourly>  ::= <generation> ("@" <hour> ("," <hour>)*)?
 <generation>  ::= /^[0-9]+$/
+                (number of snapshots of that type to keep)
 <hour>        ::= /^(0?[0-9]|1[0-9]|2[0-3])$/
+                (specific hours for hourly snapshots)
 .Ed
 .Pp
-The number of all added "generation" numbers of a filesystem cannot be larger
-than 20 because this is the maximum number of snapshots which can be
-created on a UFS/ZFS filesystem. A "generation" number of "0" disables
-the creation of backup snapshots.
+.Em Precedence for <fs_spec>:
+.Bl -enum -offset indent
+.It
+An exact path match (e.g.,
+.Cm /jails/myjail
+) takes highest precedence.
+.It
+A comma-separated list of exact paths (e.g.,
+.Cm /jails/foo,/jails/bar
+) is next. The rule applies if the filesystem matches any path in the list.
+.It
+A wildcard path match (e.g.,
+.Cm /jails/*
+or
+.Cm /j/*
+) is next.
+If a filesystem matches multiple wildcard patterns, the longest (most specific)
+pattern takes precedence.
+.It
+The global wildcard
+.Cm *
+(matching all filesystems) has the lowest precedence among wildcards and applies
+only if no other more specific rule matches.
+.El
+.Pp
+If a filesystem does not match any
+.Cm <fs_spec>
+in the
+.Va snapshot_schedule ,
+no snapshots will be taken for it.
 .Pp
 The used schedule heavily depends on how much generations of snapshots
 should be kept, which in turn depends on how much disk space is available.
@@ -110,24 +157,100 @@ this file contains local overrides for the default
 configuration.
 .El
 .Sh EXAMPLES
-In order to configure UFS/ZFS backup snapshot creation, add
-lines to
-.Pa /etc/periodic.conf
-similar to:
+To enable UFS/ZFS backup snapshot creation, add
+.Va snapshot_enable="YES"
+to
+.Pa /etc/periodic.conf .
+The
+.Va snapshot_schedule
+variable defines which filesystems are snapshotted and how often.
+.Pp
+.Em Example 1: Basic Schedules
 .Bd -literal -offset indent
-snapshot_enable="YES"
-snapshot_schedule="/,/usr:2:1:0 /var:0:2:4 /home:2:6:8@8,12,16,20"
+snapshot_schedule="/,/usr:2:1:0 /var:0:2:4@0,6,12,18 /home:2:6:8@8,12,16,20"
 .Ed
 .Pp
-This schedules the following UFS/ZFS backup snapshots: 2 weekly
-(weekly.[01]) and 1 daily (daily.0) generation of snapshots on
-the / and /usr filesystems, two daily (daily.[01]) and 4 hourly
-(hourly.[0123]) generations of snapshots on the /var filesystem,
-and 2 weekly (weekly.[01]), 6 daily (daily.[0123456]) and 8 hourly
-(hourly.[01234567]) generations of snapshots on the /home filesystem.
-While the hourly snapshots on /var are created every hour, the hourly
-snapshots on /home are created on 08:00, 12:00, 16:00 and 20:00 only.
+This configuration results in:
+.Bl -bullet -offset indent
+.It
+For 
+.Cm / 
+and 
+.Cm /usr : 
+2 weekly, 1 daily, and 0 hourly snapshots.
+.It
+For 
+.Cm /var : 
+0 weekly, 2 daily, and 4 hourly snapshots (taken at 00:00, 06:00, 12:00, 18:00).
+.It
+For 
+.Cm /home : 
+2 weekly, 6 daily, and 8 hourly snapshots (taken at 08:00, 12:00, 16:00, 20:00).
+.El
 .Pp
+.Em Example 2: Advanced Scheduling with Wildcards and Specific Overrides
+.Bd -literal -offset indent
+snapshot_schedule="\
+/jails/*:1:7:14@6,12,18 \
+/jails/important,/jails/critical:2:10:20@4,8,12,16,20 \
+/jails/ephemeral:0:1:0 \
+/data/mysql_master:0:0:24@0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23 \
+*:1:2:0"
+.Ed
+.Pp
+This more complex schedule demonstrates precedence and mixed types:
+.Bl -bullet -offset indent
+.It
+For most filesystems under
+.Cm /jails/
+(e.g., 
+.Cm /jails/webserver , /jails/utility ): 
+1 weekly, 7 daily, 14 hourly snapshots (hourly at 06:00, 12:00, 18:00). This is the baseline due to 
+.Cm /jails/* .
+.It
+For
+.Cm /jails/important
+and
+.Cm /jails/critical :
+2 weekly, 10 daily, 20 hourly snapshots (hourly at 04:00, 08:00, 12:00, 16:00, 20:00). This rule overrides the
+.Cm /jails/*
+rule for these specific filesystems due to higher precedence of comma-separated lists over wildcards.
+.It
+For
+.Cm /jails/ephemeral :
+0 weekly, 1 daily, 0 hourly snapshots. This exact match overrides
+.Cm /jails/* .
+.It
+For
+.Cm /data/mysql_master :
+No weekly or daily snapshots, but 24 hourly snapshots (one every hour).
+.It
+For any other filesystem not matching the above rules (e.g.,
+.Cm / , /var , /usr ):
+1 weekly, 2 daily, and 0 hourly snapshots. This is due to the global fallback rule
+.Cm * .
+.El
+.Pp
+.Em Example 3: Using Default Time Specification
+.Bd -literal -offset indent
+snapshot_schedule="/payloads/archive1 /data/staging:/custom/path:1:1:1"
+.Ed
+.Pp
+This demonstrates rules with and without explicit time specifications:
+.Bl -bullet -offset indent
+.It
+For
+.Cm /payloads/archive1 :
+Uses the default time specification of
+.Cm 0:0:2@8,12,16,20
+(0 weekly, 0 daily, 2 hourly at 8,12,16,20).
+.It
+For
+.Cm /data/staging
+and
+.Cm /custom/path :
+1 weekly, 1 daily, and 1 hourly snapshot (hourly snapshots taken every hour as no specific hour list is provided).
+.El
 .Sh SEE ALSO
 .Xr sh 1 ,
 .Xr crontab 5 ,
